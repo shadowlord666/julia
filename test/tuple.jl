@@ -37,6 +37,12 @@
 
 @test getindex((5,6,7,8), []) === ()
 
+## head and tail
+@test @inferred(tail((1,2,3,4))) == (2,3,4)
+@test @inferred(head((1,2,3,4))) == (1,2,3)
+@test_throws ErrorException head(())
+@test_throws MethodError tail(())
+
 ## iterating ##
 @test start((1,2,3)) === 1
 
@@ -147,6 +153,13 @@ foo(x, y, z) = x + y + z
 @test any((true,true,false)) === true
 @test any((true,true,true)) === true
 
+let sqr = x->x^2
+    @test @inferred(ntuple(sqr, Val{0})) == ()
+    @test @inferred(ntuple(sqr, Val{1})) == (1,)
+    @test @inferred(ntuple(sqr, Val{2})) == (1, 4)
+    @test @inferred(ntuple(sqr, Val{3})) == (1, 4, 9)
+end
+
 @test @inferred(ntuple(Base.Abs2Fun(), Val{0})) == ()
 @test @inferred(ntuple(Base.Abs2Fun(), Val{2})) == (1, 4)
 @test @inferred(ntuple(Base.Abs2Fun(), Val{3})) == (1, 4, 9)
@@ -156,3 +169,4 @@ foo(x, y, z) = x + y + z
 
 # issue #12854
 @test_throws TypeError ntuple(identity, Val{1:2})
+@test_throws ErrorException ntuple(identity, Val{-1})

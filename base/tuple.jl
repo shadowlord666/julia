@@ -10,6 +10,17 @@ getindex(t::Tuple, i::Real) = getfield(t, convert(Int, i))
 getindex(t::Tuple, r::AbstractArray) = tuple([t[ri] for ri in r]...)
 getindex(t::Tuple, b::AbstractArray{Bool}) = getindex(t,find(b))
 
+function head(t::Tuple)
+    @_inline_meta
+    _head((), t...)
+end
+_head(out) = error("cannot take head of an empty tuple")
+_head(out, x) = out
+function _head(out, x, t...)
+    @_inline_meta
+    _head((out..., x), t...)
+end
+
 ## iterating ##
 
 start(t::Tuple) = 1
@@ -50,19 +61,19 @@ ntuple(f::Function, n::Integer) =
     n==5 ? (f(1),f(2),f(3),f(4),f(5),) :
     tuple(ntuple(f,n-5)..., f(n-4), f(n-3), f(n-2), f(n-1), f(n))
 
-ntuple(f, ::Type{Val{0}}) = ()
-ntuple(f, ::Type{Val{1}}) = (f(1),)
-ntuple(f, ::Type{Val{2}}) = (f(1),f(2))
-ntuple(f, ::Type{Val{3}}) = (f(1),f(2),f(3))
-ntuple(f, ::Type{Val{4}}) = (f(1),f(2),f(3),f(4))
-ntuple(f, ::Type{Val{5}}) = (f(1),f(2),f(3),f(4),f(5))
-@generated function ntuple{N}(f, ::Type{Val{N}})
-    if !isa(N,Int)
-        :(throw(TypeError(:ntuple, "", Int, $(QuoteNode(N)))))
-    else
-        M = N-5
-        :(tuple(ntuple(f, Val{$M})..., f($N-4), f($N-3), f($N-2), f($N-1), f($N)))
-    end
+# inferrable ntuple, checking that N is a nonnegative Int (issue #12854)
+function ntuple{N}(f, ::Type{Val{N}})
+    @_inline_meta
+    checkN(N, :ntuple)
+    _ntuple((), f, Val{N})
+end
+checkN(N::Int, sym) = nothing # N >= 0 || error("size or dimension is negative: ", N)
+checkN(N::ANY, sym) = throw(TypeError(sym, "", Int, N))
+
+_ntuple{N}(out::NTuple{N}, f, ::Type{Val{N}}) = out
+function _ntuple{N}(out, f, ::Type{Val{N}})
+    @_inline_meta
+    _ntuple((out..., f(length(out)+1)), f, Val{N})
 end
 
 # 0 argument function

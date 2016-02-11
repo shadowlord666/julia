@@ -492,6 +492,11 @@ export
     polygamma,
     zeta,
 
+# tuples
+    head,
+    ntuple,
+    tail,
+
 # arrays
     bitbroadcast,
     broadcast!,
@@ -1125,7 +1130,6 @@ export
     atreplinit,
     clipboard,
     exit,
-    ntuple,
     quit,
 
 # IP address stuff
