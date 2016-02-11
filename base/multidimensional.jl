@@ -46,6 +46,11 @@ for op in (:+, :-, :min, :max)
     end
 end
 
+(+){N}(index::CartesianIndex{N}, i::Integer) = CartesianIndex{N}(map(x->x+i, index.I))
+(+){N}(i::Integer, index::CartesianIndex{N}) = index+i
+(-){N}(index::CartesianIndex{N}, i::Integer) = CartesianIndex{N}(map(x->x-i, index.I))
+(-){N}(i::Integer, index::CartesianIndex{N}) = CartesianIndex{N}(map(x->i-x, index.I))
+
 @generated function *{N}(a::Integer, index::CartesianIndex{N})
     I = index
     args = [:(a*index[$d]) for d = 1:N]
@@ -63,7 +68,9 @@ end
     startargs = fill(1, N)
     :(CartesianRange($I($(startargs...)), I))
 end
+CartesianRange(::Tuple{}) = CartesianRange{CartesianIndex{0}}(CartesianIndex{0}(()),CartesianIndex{0}(()))
 CartesianRange{N}(sz::NTuple{N,Int}) = CartesianRange(CartesianIndex(sz))
+CartesianRange{N,R<:UnitRange}(rngs::NTuple{N,R}) = CartesianRange(CartesianIndex(map(r->first(r), rngs)), CartesianIndex(map(r->last(r), rngs)))
 
 ndims(R::CartesianRange) = length(R.start)
 ndims{I<:CartesianIndex}(::Type{CartesianRange{I}}) = length(I)
