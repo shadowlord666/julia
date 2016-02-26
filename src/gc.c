@@ -2055,14 +2055,11 @@ static void pre_mark(void)
     gc_push_root(jl_false, 0);
 }
 
-static int n_finalized;
-
 // find unmarked objects that need to be finalized from the finalizer list "list".
 // this must happen last in the mark phase.
 // if dryrun == 1, it does not schedule any actual finalization and only marks finalizers
 static void post_mark(arraylist_t *list, int dryrun)
 {
-    n_finalized = 0;
     for(size_t i=0; i < list->len; i+=2) {
         jl_value_t *v = (jl_value_t*)list->items[i];
         jl_value_t *fin = (jl_value_t*)list->items[i+1];
@@ -2088,7 +2085,6 @@ static void post_mark(arraylist_t *list, int dryrun)
             }
             gc_push_root(v, 0);
             if (!dryrun) schedule_finalization(v, fin);
-            n_finalized++;
         }
         if (!dryrun && isold) {
             arraylist_push(&finalizer_list_marked, v);
