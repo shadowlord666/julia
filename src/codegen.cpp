@@ -37,6 +37,7 @@
 #ifdef LLVM37
 #include <llvm/Analysis/TargetTransformInfo.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
+#include <llvm/Object/SymbolSize.h>
 #else
 #include <llvm/Target/TargetLibraryInfo.h>
 #endif
@@ -1307,16 +1308,18 @@ void jl_extern_c(jl_function_t *f, jl_value_t *rt, jl_value_t *argt, char *name)
 
 // --- native code info, and dump function to IR and ASM ---
 
-extern int jl_get_llvmf_info(uint64_t fptr, uint64_t *symsize, uint64_t *slide,
+extern int jl_DI_for_fptr(uint64_t fptr, uint64_t *symsize, int64_t *slide, const object::ObjectFile **object,
 #ifdef USE_MCJIT
-    const object::ObjectFile **object
+                      llvm::DIContext **context
 #else
-    std::vector<JITEvent_EmittedFunctionDetails::LineStart> *lines
+                      std::vector<JITEvent_EmittedFunctionDetails::LineStart> *lines
 #endif
-    );
-
-extern "C"
-uint64_t jl_getUnwindInfo(uint64_t dwAddr);
+                      );
+extern bool jl_dylib_DI_for_fptr(size_t pointer, const object::ObjectFile **object, llvm::DIContext **context, int64_t *slide, bool onlySysImg,
+    bool *isSysImg, void **saddr, char **name, char **filename);
+#ifdef USE_MCJIT
+extern void jl_cleanup_DI(llvm::DIContext *context);
+#endif
 
 // Get pointer to llvm::Function instance, compiling if necessary
 extern "C" JL_DLLEXPORT
@@ -1396,16 +1399,7 @@ void *jl_get_llvmf(jl_function_t *f, jl_tupletype_t *tt, bool getwrapper, bool g
         return llvmf;
     }
 
-    if (linfo->fptr && !jl_getUnwindInfo((uintptr_t)linfo->fptr)) {
-        // Not in in the current ExecutionEngine
-        // found in the system image: force a recompile
-        linfo->functionObjects.specFunctionObject = NULL;
-        linfo->functionObjects.functionObject = NULL;
-        linfo->fptr = NULL;
-    }
-    if (linfo->functionObjects.functionObject == NULL) {
-        jl_compile_linfo(linfo, NULL);
-    }
+    assert(getdeclarations);
     Function *llvmf;
     if (!getwrapper && linfo->functionObjects.specFunctionObject != NULL) {
         llvmf = (Function*)linfo->functionObjects.specFunctionObject;
@@ -1413,12 +1407,6 @@ void *jl_get_llvmf(jl_function_t *f, jl_tupletype_t *tt, bool getwrapper, bool g
     else {
         llvmf = (Function*)linfo->functionObjects.functionObject;
     }
-#if !defined(USE_ORCJIT) && !defined(USE_MCJIT)
-    if (!getdeclarations) {
-        ValueToValueMapTy VMap;
-        llvmf = CloneFunction(llvmf, VMap, false);
-    }
-#endif
     JL_GC_POP();
     return llvmf;
 }
@@ -1491,7 +1479,7 @@ const jl_value_t *jl_dump_function_ir(void *f, bool strip_ir_metadata, bool dump
 extern "C"
 void jl_dump_asm_internal(uintptr_t Fptr, size_t Fsize, size_t slide,
 #ifdef USE_MCJIT
-                          const object::ObjectFile *objectfile,
+                          llvm::DIContext *context,
 #else
                           std::vector<JITEvent_EmittedFunctionDetails::LineStart> lineinfo,
 #endif
@@ -1501,6 +1489,15 @@ void jl_dump_asm_internal(uintptr_t Fptr, size_t Fsize, size_t slide,
                           formatted_raw_ostream &stream
 #endif
                           );
+
+// This is expensive, but it's only used for interactive mode
+static uint64_t compute_obj_symsize(const object::ObjectFile *obj, uint64_t offset)
+{
+    for (const auto &sym_size : object::computeSymbolSizes(*obj))
+        if (offset == sym_size.first.getValue())
+            return sym_size.second;
+    return 0;
+}
 
 extern "C" JL_DLLEXPORT
 const jl_value_t *jl_dump_function_asm(void *f, int raw_mc)
@@ -1516,27 +1513,51 @@ const jl_value_t *jl_dump_function_asm(void *f, int raw_mc)
         jl_error("jl_dump_function_asm: Expected Function*");
 
     // Dump assembly code
-    uint64_t symsize, slide;
+    uint64_t symsize = 0;
+    int64_t slide = 0;
 #ifdef USE_MCJIT
     uint64_t fptr = getAddressForOrCompileFunction(llvmf);
-    const object::ObjectFile *object;
+#ifdef USE_ORCJIT
+    // Look in the system image as well
+    if (fptr == 0)
+        fptr = jl_ExecutionEngine->findSymbol(
+            jl_ExecutionEngine->mangle(llvmf->getName()), true).getAddress();
+#endif
+    llvm::DIContext *context;
 #else
     uint64_t fptr = (uintptr_t)jl_ExecutionEngine->getPointerToFunction(llvmf);
-    std::vector<JITEvent_EmittedFunctionDetails::LineStart> object;
+    std::vector<JITEvent_EmittedFunctionDetails::LineStart> context;
 #endif
+    const ObjectFile *object = NULL;
     assert(fptr != 0);
-    if (jl_get_llvmf_info(fptr, &symsize, &slide, &object)) {
-        if (raw_mc)
-            return (jl_value_t*)jl_pchar_to_array((char*)fptr, symsize);
+    if (!jl_DI_for_fptr(fptr, &symsize, &slide, &object, &context))
+        if (!jl_dylib_DI_for_fptr(fptr, &object, &context, &slide, false,
+            NULL, NULL, NULL, NULL)) {
+                jl_printf(JL_STDERR, "WARNING: Unable to find function pointer\n");
+                return jl_cstr_to_string("");
+        }
 #ifdef LLVM37
-        jl_dump_asm_internal(fptr, symsize, slide, object, stream);
-#else
-        jl_dump_asm_internal(fptr, symsize, slide, object, fstream);
+    if (symsize == 0)
+        symsize = compute_obj_symsize(object, fptr + slide);
 #endif
+    if (symsize == 0) {
+        jl_printf(JL_STDERR, "WARNING: Could not determine size of symbol\n");
+        return jl_cstr_to_string("");
     }
-    else {
-        jl_printf(JL_STDERR, "WARNING: Unable to find function pointer\n");
+
+    if (raw_mc) {
+#ifdef LLVM37
+        jl_cleanup_DI(context);
+#endif
+        return (jl_value_t*)jl_pchar_to_array((char*)fptr, symsize);
     }
+#ifdef LLVM37
+    jl_dump_asm_internal(fptr, symsize, slide, context, stream);
+    jl_cleanup_DI(context);
+#else
+    jl_dump_asm_internal(fptr, symsize, slide, context, fstream);
+#endif
+
 #ifndef LLVM37
     fstream.flush();
 #endif

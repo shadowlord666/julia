@@ -87,7 +87,6 @@ struct FuncInfo {
 #else
 struct ObjectInfo {
     const object::ObjectFile *object;
-    size_t size;
 #ifdef LLVM39
     DIContext *context;
 #elif defined(LLVM37)
@@ -353,11 +352,11 @@ public:
 
 #ifdef LLVM37
         auto symbols = object::computeSymbolSizes(obj);
+        bool first = true;
         for(const auto &sym_size : symbols) {
             const object::SymbolRef &sym_iter = sym_size.first;
             object::SymbolRef::Type SymbolType = sym_iter.getType();
             if (SymbolType != object::SymbolRef::ST_Function) continue;
-            uint64_t Size = sym_size.second;
             uint64_t Addr = sym_iter.getAddress().get();
 #ifdef LLVM38
             Section = sym_iter.getSection().get();
@@ -391,14 +390,17 @@ public:
                 linfo = linfo_it->second;
                 linfo_in_flight.erase(linfo_it);
             }
-            ObjectInfo tmp = {&debugObj, (size_t)Size,
+            if (first) {
+                ObjectInfo tmp = {&debugObj,
 #ifdef LLVM39
-                new DWARFContextInMemory(debugObj, &L),
+                    new DWARFContextInMemory(debugObj, &L),
 #else
-                L.clone().release(),
+                    L.clone().release(),
 #endif
-                linfo};
-            objectmap[Addr] = tmp;
+                    linfo};
+                objectmap[SectionAddr] = tmp;
+                first = false;
+           }
         }
 
 #else // pre-LLVM37
@@ -632,7 +634,7 @@ done:
 #include <dlfcn.h>
 #endif
 typedef struct {
-    llvm::object::ObjectFile *obj;
+    const llvm::object::ObjectFile *obj;
     DIContext *ctx;
     int64_t slide;
 } objfileentry_t;
@@ -688,20 +690,10 @@ extern "C" void jl_register_fptrs(uint64_t sysimage_base, void **fptrs, jl_lambd
     sysimg_fvars_n = n;
 }
 
-// *name and *filename should be either NULL or malloc'd pointer
-static void jl_getDylibFunctionInfo(char **name, char **filename, size_t *line,
-                                    char **inlinedat_file, size_t *inlinedat_line, jl_lambda_info_t **outer_linfo,
-                                    size_t pointer, int *fromC, int skipC, int skipInline)
+bool jl_dylib_DI_for_fptr(size_t pointer, const llvm::object::ObjectFile **obj, llvm::DIContext **context, int64_t *slide,
+    bool onlySysImg, bool *isSysImg, void **saddr, char **name, char **filename)
 {
-    // This function is not allowed to reference any TLS variables since
-    // it can be called from an unmanaged thread on OSX.
 #ifdef _OS_WINDOWS_
-    IMAGEHLP_MODULE64 ModuleInfo;
-    BOOL isvalid;
-    if (jl_in_stackwalk) {
-        *fromC = 1;
-        return;
-    }
     ModuleInfo.SizeOfStruct = sizeof(IMAGEHLP_MODULE64);
     jl_in_stackwalk = 1;
     isvalid = SymGetModuleInfo64(GetCurrentProcess(), (DWORD64)pointer, &ModuleInfo);
@@ -709,9 +701,9 @@ static void jl_getDylibFunctionInfo(char **name, char **filename, size_t *line,
     if (isvalid) {
         char *fname = ModuleInfo.LoadedImageName;
         DWORD64 fbase = ModuleInfo.BaseOfImage;
-        *fromC = (fbase != jl_sysimage_base);
-        if (skipC && *fromC) {
-            return;
+        *isSysImg = fbase == jl_sysimage_base;
+        if (onlySysImg && !isSysImg) {
+            return false;
         }
         static char frame_info_func[
             sizeof(SYMBOL_INFO) +
@@ -720,7 +712,6 @@ static void jl_getDylibFunctionInfo(char **name, char **filename, size_t *line,
         DWORD dwDisplacement = 0;
         DWORD64 dwDisplacement64 = 0;
         DWORD64 dwAddress = pointer;
-        void *saddr = NULL;
         PSYMBOL_INFO pSymbol = (PSYMBOL_INFO)frame_info_func;
         pSymbol->SizeOfStruct = sizeof(SYMBOL_INFO);
         pSymbol->MaxNameLen = MAX_SYM_NAME;
@@ -728,50 +719,44 @@ static void jl_getDylibFunctionInfo(char **name, char **filename, size_t *line,
         if (SymFromAddr(GetCurrentProcess(), dwAddress, &dwDisplacement64,
                         pSymbol)) {
             // SymFromAddr returned success
-            jl_copy_str(name, pSymbol->Name);
-            saddr = (void*)(uintptr_t)pSymbol->Address;
+            if (name)
+                jl_copy_str(name, pSymbol->Name);
+            if (saddr)
+                *saddr = (void*)(uintptr_t)pSymbol->Address;
+            if (symsize)
+                *symsize = pSymbol->Size;
         }
         else {
             // SymFromAddr failed
             //jl_printf(JL_STDERR,"SymFromAddr returned error : %lu\n", GetLastError());
         }
 
-        frame_info_line.SizeOfStruct = sizeof(IMAGEHLP_LINE64);
-        if (SymGetLineFromAddr64(GetCurrentProcess(), dwAddress, &dwDisplacement, &frame_info_line)) {
-            // SymGetLineFromAddr64 returned success
-            // record source file name and line number
-            if (frame_info_line.FileName)
-                jl_copy_str(filename, frame_info_line.FileName);
-            *line = frame_info_line.LineNumber;
-        }
-        else if (*fromC) {
-            // No debug info, use dll name instead
-            jl_copy_str(filename, fname);
-        }
         jl_in_stackwalk = 0;
 #else // ifdef _OS_WINDOWS_
     Dl_info dlinfo;
     if ((dladdr((void*)pointer, &dlinfo) != 0) && dlinfo.dli_fname) {
         const char *fname;
         uint64_t fbase = (uint64_t)dlinfo.dli_fbase;
-        void *saddr = dlinfo.dli_saddr;
+        if (saddr)
+            *saddr = dlinfo.dli_saddr;
 #if defined(_OS_DARWIN_)
         size_t msize = (size_t)(((uint64_t)-1)-fbase);
 #endif
-        *fromC = (fbase != jl_sysimage_base);
-        if (skipC && *fromC)
-            return;
+        if (isSysImg)
+            *isSysImg = fbase == jl_sysimage_base;
+        if (onlySysImg && !isSysImg) {
+            return false;
+        }
         // In case we fail with the debug info lookup, we at least still
         // have the function name, even if we don't have line numbers
-        jl_copy_str(name, dlinfo.dli_sname);
-        jl_copy_str(filename, dlinfo.dli_fname);
+        if (name)
+            jl_copy_str(name, dlinfo.dli_sname);
+        if (filename)
+            jl_copy_str(filename, dlinfo.dli_fname);
         fname = dlinfo.dli_fname;
 #endif // ifdef _OS_WINDOWS_
-        DIContext *context = NULL;
-        int64_t slide = 0;
 #if !defined(_OS_WINDOWS_) || defined(LLVM35)
         obfiletype::iterator it = objfilemap.find(fbase);
-        llvm::object::ObjectFile *obj = NULL;
         if (it == objfilemap.end()) {
             // TODO: need write lock here for objfilemap syncronization
 #if defined(_OS_DARWIN_)
@@ -793,24 +778,25 @@ static void jl_getDylibFunctionInfo(char **name, char **filename, size_t *line,
                 membuf);
 #endif
             if (!origerrorobj) {
-                objfileentry_t entry = {obj,context,slide};
+                objfileentry_t entry = {*obj,*context,*slide};
                 objfilemap[fbase] = entry;
-                goto lookup;
+                return true;
             }
 #ifdef LLVM36
-            llvm::object::MachOObjectFile *morigobj = (llvm::object::MachOObjectFile *)origerrorobj.get().release();
+            *obj = (llvm::object::MachOObjectFile *)origerrorobj.get().release();
 #elif defined(LLVM35)
-            llvm::object::MachOObjectFile *morigobj = (llvm::object::MachOObjectFile *)origerrorobj.get();
+            *obj = (llvm::object::MachOObjectFile *)origerrorobj.get();
 #else
-            llvm::object::MachOObjectFile *morigobj = (llvm::object::MachOObjectFile *)origerrorobj;
+            *obj = (llvm::object::MachOObjectFile *)origerrorobj;
 #endif
+            llvm::object::MachOObjectFile *morigobj = (llvm::object::MachOObjectFile *)*obj;
             // First find the uuid of the object file (we'll use this to make sure we find the
             // correct debug symbol file).
             uint8_t uuid[16], uuid2[16];
             if (!getObjUUID(morigobj,uuid)) {
-                objfileentry_t entry = {obj,context,slide};
+                objfileentry_t entry = {*obj,*context,*slide};
                 objfilemap[fbase] = entry;
-                goto lookup;
+                return true;
             }
 
             // On OS X debug symbols are not contained in the dynamic library and that's why
@@ -837,31 +823,31 @@ static void jl_getDylibFunctionInfo(char **name, char **filename, size_t *line,
             if (errorobj) {
 #ifdef LLVM36
                 auto binary = errorobj.get().takeBinary();
-                obj = binary.first.release();
+                *obj = binary.first.release();
                 binary.second.release();
 #elif defined(LLVM35)
-                obj = errorobj.get();
+                *obj = errorobj.get();
 #else
-                obj = errorobj;
+                *obj = errorobj;
 #endif
 #ifdef _OS_DARWIN_
                 if (getObjUUID(morigobj,uuid2) && memcmp(uuid,uuid2,sizeof(uuid)) == 0) {
 #endif
 #ifdef LLVM37
-                    context = new DWARFContextInMemory(*obj);
+                    *context = new DWARFContextInMemory(**obj);
 #elif defined(LLVM36)
-                    context = DIContext::getDWARFContext(*obj);
+                    *context = DIContext::getDWARFContext(**obj);
 #else
-                    context = DIContext::getDWARFContext(obj);
+                    *context = DIContext::getDWARFContext(*obj);
 #endif
-                    slide = -(uint64_t)fbase;
+                    *slide = -(uint64_t)fbase;
 #ifdef _OS_DARWIN_
                 }
 #endif
 #ifdef _OS_WINDOWS_
 #ifdef LLVM35
-                assert(obj->isCOFF());
-                llvm::object::COFFObjectFile *coffobj = (llvm::object::COFFObjectFile *)obj;
+                assert(*obj->isCOFF());
+                llvm::object::COFFObjectFile *coffobj = (llvm::object::COFFObjectFile *)*obj;
                 const llvm::object::pe32plus_header *pe32plus;
                 coffobj->getPE32PlusHeader(pe32plus);
                 if (pe32plus != NULL) {
@@ -881,40 +867,128 @@ static void jl_getDylibFunctionInfo(char **name, char **filename, size_t *line,
 #endif
 #endif
             }
-            objfileentry_t entry = {obj,context,slide};
+            objfileentry_t entry = {*obj,*context,*slide};
             objfilemap[fbase] = entry;
         }
         else {
-            obj = it->second.obj;
-            context = it->second.ctx;
-            slide = it->second.slide;
+            *obj = it->second.obj;
+            *context = it->second.ctx;
+            *slide = it->second.slide;
         }
-#endif // ifdef _OS_WINDOWS && !LLVM35
-#ifdef _OS_DARWIN_
-lookup:
+        return true;
+    }
+    return false;
 #endif
-        lookup_pointer(context, name, line, filename, inlinedat_line, inlinedat_file, pointer+slide,
-                       fbase == jl_sysimage_base, fromC);
-        if (jl_sysimage_base == fbase && sysimg_fvars) {
+}
+
+// *name and *filename should be either NULL or malloc'd pointer
+static void jl_getDylibFunctionInfo(char **name, char **filename, size_t *line,
+                                    char **inlinedat_file, size_t *inlinedat_line, jl_lambda_info_t **outer_linfo,
+                                    size_t pointer, int *fromC, int skipC, int skipInline)
+{
+    // This function is not allowed to reference any TLS variables since
+    // it can be called from an unmanaged thread on OSX.
+#ifdef _OS_WINDOWS_
+    IMAGEHLP_MODULE64 ModuleInfo;
+    BOOL isvalid;
+    if (jl_in_stackwalk) {
+        *fromC = 1;
+        return;
+    }
+    jl_in_stackwalk = 1;
+    DWORD64 dwAddress = pointer;
+    frame_info_line.SizeOfStruct = sizeof(IMAGEHLP_LINE64);
+    if (SymGetLineFromAddr64(GetCurrentProcess(), dwAddress, &dwDisplacement, &frame_info_line)) {
+        // SymGetLineFromAddr64 returned success
+        // record source file name and line number
+        if (frame_info_line.FileName && filename)
+            jl_copy_str(filename, frame_info_line.FileName);
+        *line = frame_info_line.LineNumber;
+    }
+    else if (*fromC) {
+        // No debug info, use dll name instead
+        if (filename)
+            jl_copy_str(filename, fname);
+    }
+    jl_in_stackwalk = 0;
+#endif
+    const object::ObjectFile *object;
+    llvm::DIContext *context;
+    bool isSysImg;
+    void *saddr;
+    int64_t slide;
+    if (!jl_dylib_DI_for_fptr(pointer, &object, &context, &slide, skipC, &isSysImg, &saddr, name, filename)) {
+        *fromC = 1;
+        return;
+    }
+
+    lookup_pointer(context, name, line, filename, inlinedat_line, inlinedat_file, pointer+slide,
+                   isSysImg, fromC);
+    if (isSysImg && sysimg_fvars) {
 #ifdef _OS_LINUX_
-            unw_proc_info_t pip;
-            if (!saddr && unw_get_proc_info_by_ip(unw_local_addr_space,
-                                                  pointer, &pip, NULL) == 0)
-                saddr = (void*)pip.start_ip;
+        unw_proc_info_t pip;
+        if (!saddr && unw_get_proc_info_by_ip(unw_local_addr_space,
+                                              pointer, &pip, NULL) == 0)
+            saddr = (void*)pip.start_ip;
 #endif
-            if (saddr) {
-                for (size_t i = 0; i < sysimg_fvars_n; i++) {
-                    if (saddr == sysimg_fvars[i]) {
-                        *outer_linfo = sysimg_fvars_linfo[i];
-                        break;
-                    }
+        if (saddr) {
+            for (size_t i = 0; i < sysimg_fvars_n; i++) {
+                if (saddr == sysimg_fvars[i]) {
+                    *outer_linfo = sysimg_fvars_linfo[i];
+                    break;
                 }
             }
         }
     }
-    else {
-        *fromC = 1;
+}
+
+int jl_DI_for_fptr(uint64_t fptr, uint64_t *symsize, int64_t *slide, const object::ObjectFile **object,
+#ifdef USE_MCJIT
+                      llvm::DIContext **context
+#else
+                      std::vector<JITEvent_EmittedFunctionDetails::LineStart> *lines
+#endif
+                      )
+{
+    int found = 0;
+#ifndef USE_MCJIT
+    std::map<size_t, FuncInfo, revcomp> &fmap = jl_jit_events->getMap();
+    std::map<size_t, FuncInfo, revcomp>::iterator fit = fmap.find(fptr);
+
+    if (fit != fmap.end()) {
+        *symsize = fit->second.lengthAdr;
+        *lines = fit->second.lines;
+        *slide = 0;
+        found = 1;
     }
+#else // MCJIT version
+    std::map<size_t, ObjectInfo, revcomp> &objmap = jl_jit_events->getObjectMap();
+    std::map<size_t, ObjectInfo, revcomp>::iterator fit = objmap.find(fptr);
+
+    if (fit != objmap.end()) {
+        *symsize = 0;
+        *slide = 0;
+        *object = fit->second.object;
+#if defined(LLVM39)
+        *context = fit->second.context;
+#elif defined(LLVM37)
+        *context = new DWARFContextInMemory(*fit->second.object, fit->second.L);
+#else
+        *context = DIContext::getDWARFContext(*fit->second.object);
+        *slide = fit->second.slide;
+#endif
+        found = 1;
+    }
+#endif
+    uv_rwlock_rdunlock(&threadsafe);
+    return found;
+}
+
+void jl_cleanup_DI(llvm::DIContext *context)
+{
+#ifndef LLVM39
+    delete context;
+#endif
 }
 
 // Set *name and *filename to either NULL or malloc'd string
@@ -933,35 +1007,13 @@ void jl_getFunctionInfo(char **name, char **filename, size_t *line,
     *fromC = 0;
 
 #ifdef USE_MCJIT
-    // With MCJIT we can get function information directly from the ObjectFile
-    std::map<size_t, ObjectInfo, revcomp> &objmap = jl_jit_events->getObjectMap();
-    std::map<size_t, ObjectInfo, revcomp>::iterator it =
-        objmap.lower_bound(pointer);
-
-    if (it != objmap.end() &&
-        (intptr_t)(*it).first + (*it).second.size > pointer) {
-        *outer_linfo = (*it).second.linfo;
-#if defined(_OS_DARWIN_) && !defined(LLVM37)
-        *name = jl_demangle((*it).second.name);
-        DIContext *context = NULL; // versions of MCJIT < 3.7 can't handle MachO relocations
-#else
-#ifdef LLVM36
-#if defined(LLVM39)
-        DIContext *context = it->second.context;
-#elif defined(LLVM37)
-        DIContext *context = new DWARFContextInMemory(*it->second.object, it->second.L);
-#else
-        DIContext *context = DIContext::getDWARFContext(*it->second.object);
-        pointer -= (*it).second.slide;
-#endif
-#else
-        DIContext *context = DIContext::getDWARFContext(const_cast<object::ObjectFile*>(it->second.object));
-#endif
-#endif
-        lookup_pointer(context, name, line, filename, inlinedat_line, inlinedat_file, pointer, 1, fromC);
-#ifndef LLVM39
-        delete context;
-#endif
+    llvm::DIContext *context;
+    const llvm::object::ObjectFile *object;
+    uint64_t symsize;
+    int64_t slide;
+    if (jl_DI_for_fptr(pointer, &symsize, &slide, &object, &context)) {
+        lookup_pointer(context, name, line, filename, inlinedat_line, inlinedat_file, pointer+slide, 1, fromC);
+        jl_cleanup_DI(context);
     }
 
 #else // !USE_MCJIT
@@ -1042,44 +1094,6 @@ void jl_getFunctionInfo(char **name, char **filename, size_t *line,
     }
 
     uv_rwlock_rdunlock(&threadsafe);
-}
-
-int jl_get_llvmf_info(uint64_t fptr, uint64_t *symsize, uint64_t *slide,
-#ifdef USE_MCJIT
-                      const object::ObjectFile **object
-#else
-                      std::vector<JITEvent_EmittedFunctionDetails::LineStart> *lines
-#endif
-                      )
-{
-    int found = 0;
-#ifndef USE_MCJIT
-    std::map<size_t, FuncInfo, revcomp> &fmap = jl_jit_events->getMap();
-    std::map<size_t, FuncInfo, revcomp>::iterator fit = fmap.find(fptr);
-
-    if (fit != fmap.end()) {
-        *symsize = fit->second.lengthAdr;
-        *lines = fit->second.lines;
-        *slide = 0;
-        found = 1;
-    }
-#else // MCJIT version
-    std::map<size_t, ObjectInfo, revcomp> &objmap = jl_jit_events->getObjectMap();
-    std::map<size_t, ObjectInfo, revcomp>::iterator fit = objmap.find(fptr);
-
-    if (fit != objmap.end()) {
-        *symsize = fit->second.size;
-        *object = fit->second.object;
-#if defined(LLVM36) && !defined(LLVM37)
-        *slide = fit->second.slide;
-#else
-        *slide = 0;
-#endif
-        found = 1;
-    }
-#endif
-    uv_rwlock_rdunlock(&threadsafe);
-    return found;
 }
 
 #if defined(LLVM37) && (defined(_OS_LINUX_) || (defined(_OS_DARWIN_) && defined(LLVM_SHLIB)))
@@ -1530,7 +1544,7 @@ uint64_t jl_getUnwindInfo(uint64_t dwAddr)
     std::map<size_t, ObjectInfo, revcomp> &objmap = jl_jit_events->getObjectMap();
     std::map<size_t, ObjectInfo, revcomp>::iterator it = objmap.lower_bound(dwAddr);
     uint64_t ipstart = 0; // ip of the first instruction in the function (if found)
-    if (it != objmap.end() && (intptr_t)(*it).first + (*it).second.size > dwAddr) {
+    if (it != objmap.end()) {
         ipstart = (uint64_t)(intptr_t)(*it).first;
     }
     uv_rwlock_rdunlock(&threadsafe);
