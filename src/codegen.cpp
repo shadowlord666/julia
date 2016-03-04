@@ -1308,7 +1308,8 @@ void jl_extern_c(jl_function_t *f, jl_value_t *rt, jl_value_t *argt, char *name)
 
 // --- native code info, and dump function to IR and ASM ---
 
-extern int jl_DI_for_fptr(uint64_t fptr, uint64_t *symsize, int64_t *slide, const object::ObjectFile **object,
+extern int jl_DI_for_fptr(uint64_t fptr, uint64_t *symsize, int64_t *slide, int64_t *SectionSlide,
+                      const object::ObjectFile **object,
 #ifdef USE_MCJIT
                       llvm::DIContext **context
 #else
@@ -1398,8 +1399,9 @@ void *jl_get_llvmf(jl_function_t *f, jl_tupletype_t *tt, bool getwrapper, bool g
         JL_GC_POP();
         return llvmf;
     }
-
-    assert(getdeclarations);
+    if (linfo->functionObjects.functionObject == NULL) {
+        jl_compile_linfo(linfo, NULL);
+    }
     Function *llvmf;
     if (!getwrapper && linfo->functionObjects.specFunctionObject != NULL) {
         llvmf = (Function*)linfo->functionObjects.specFunctionObject;
@@ -1514,7 +1516,7 @@ const jl_value_t *jl_dump_function_asm(void *f, int raw_mc)
 
     // Dump assembly code
     uint64_t symsize = 0;
-    int64_t slide = 0;
+    int64_t slide = 0, SectionSlide = 0;
 #ifdef USE_MCJIT
     uint64_t fptr = getAddressForOrCompileFunction(llvmf);
 #ifdef USE_ORCJIT
@@ -1530,7 +1532,7 @@ const jl_value_t *jl_dump_function_asm(void *f, int raw_mc)
 #endif
     const ObjectFile *object = NULL;
     assert(fptr != 0);
-    if (!jl_DI_for_fptr(fptr, &symsize, &slide, &object, &context))
+    if (!jl_DI_for_fptr(fptr, &symsize, &slide, &SectionSlide, &object, &context))
         if (!jl_dylib_DI_for_fptr(fptr, &object, &context, &slide, false,
             NULL, NULL, NULL, NULL)) {
                 jl_printf(JL_STDERR, "WARNING: Unable to find function pointer\n");
@@ -1538,7 +1540,7 @@ const jl_value_t *jl_dump_function_asm(void *f, int raw_mc)
         }
 #ifdef LLVM37
     if (symsize == 0)
-        symsize = compute_obj_symsize(object, fptr + slide);
+        symsize = compute_obj_symsize(object, fptr + slide + SectionSlide);
 #endif
     if (symsize == 0) {
         jl_printf(JL_STDERR, "WARNING: Could not determine size of symbol\n");

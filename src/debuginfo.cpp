@@ -87,6 +87,8 @@ struct FuncInfo {
 #else
 struct ObjectInfo {
     const object::ObjectFile *object;
+    uint64_t SectionAddr;
+    size_t SectionSize;
 #ifdef LLVM39
     DIContext *context;
 #elif defined(LLVM37)
@@ -374,8 +376,8 @@ public:
 #endif
             Addr += SectionAddr;
             StringRef sName = sym_iter.getName().get();
-#if defined(_OS_WINDOWS_)
             uint64_t SectionSize = Section->getSize();
+#if defined(_OS_WINDOWS_)
             if (SectionAddrCheck)
                 assert(SectionAddrCheck == SectionAddr);
             else
@@ -392,6 +394,8 @@ public:
             }
             if (first) {
                 ObjectInfo tmp = {&debugObj,
+                    SectionAddr,
+                    SectionSize,
 #ifdef LLVM39
                     new DWARFContextInMemory(debugObj, &L),
 #else
@@ -723,8 +727,6 @@ bool jl_dylib_DI_for_fptr(size_t pointer, const llvm::object::ObjectFile **obj, 
                 jl_copy_str(name, pSymbol->Name);
             if (saddr)
                 *saddr = (void*)(uintptr_t)pSymbol->Address;
-            if (symsize)
-                *symsize = pSymbol->Size;
         }
         else {
             // SymFromAddr failed
@@ -942,7 +944,8 @@ static void jl_getDylibFunctionInfo(char **name, char **filename, size_t *line,
     }
 }
 
-int jl_DI_for_fptr(uint64_t fptr, uint64_t *symsize, int64_t *slide, const object::ObjectFile **object,
+int jl_DI_for_fptr(uint64_t fptr, uint64_t *symsize, int64_t *slide, int64_t *SectionSlide,
+                      const object::ObjectFile **object,
 #ifdef USE_MCJIT
                       llvm::DIContext **context
 #else
@@ -953,9 +956,9 @@ int jl_DI_for_fptr(uint64_t fptr, uint64_t *symsize, int64_t *slide, const objec
     int found = 0;
 #ifndef USE_MCJIT
     std::map<size_t, FuncInfo, revcomp> &fmap = jl_jit_events->getMap();
-    std::map<size_t, FuncInfo, revcomp>::iterator fit = fmap.find(fptr);
+    std::map<size_t, FuncInfo, revcomp>::iterator fit = fmap.lower_bound(fptr);
 
-    if (fit != fmap.end()) {
+    if (fit != fmap.end() && fptr < fit->first + fit->second.lengthAdr) {
         *symsize = fit->second.lengthAdr;
         *lines = fit->second.lines;
         *slide = 0;
@@ -963,12 +966,13 @@ int jl_DI_for_fptr(uint64_t fptr, uint64_t *symsize, int64_t *slide, const objec
     }
 #else // MCJIT version
     std::map<size_t, ObjectInfo, revcomp> &objmap = jl_jit_events->getObjectMap();
-    std::map<size_t, ObjectInfo, revcomp>::iterator fit = objmap.find(fptr);
+    std::map<size_t, ObjectInfo, revcomp>::iterator fit = objmap.lower_bound(fptr);
 
-    if (fit != objmap.end()) {
+    if (fit != objmap.end() && fptr < fit->first + fit->second.SectionSize) {
         *symsize = 0;
         *slide = 0;
         *object = fit->second.object;
+        *SectionSlide = -fit->second.SectionAddr;
 #if defined(LLVM39)
         *context = fit->second.context;
 #elif defined(LLVM37)
@@ -1010,8 +1014,8 @@ void jl_getFunctionInfo(char **name, char **filename, size_t *line,
     llvm::DIContext *context;
     const llvm::object::ObjectFile *object;
     uint64_t symsize;
-    int64_t slide;
-    if (jl_DI_for_fptr(pointer, &symsize, &slide, &object, &context)) {
+    int64_t slide, SectionSlide;
+    if (jl_DI_for_fptr(pointer, &symsize, &slide, &SectionSlide, &object, &context)) {
         lookup_pointer(context, name, line, filename, inlinedat_line, inlinedat_file, pointer+slide, 1, fromC);
         jl_cleanup_DI(context);
     }
@@ -1543,8 +1547,8 @@ uint64_t jl_getUnwindInfo(uint64_t dwAddr)
 {
     std::map<size_t, ObjectInfo, revcomp> &objmap = jl_jit_events->getObjectMap();
     std::map<size_t, ObjectInfo, revcomp>::iterator it = objmap.lower_bound(dwAddr);
-    uint64_t ipstart = 0; // ip of the first instruction in the function (if found)
-    if (it != objmap.end()) {
+    uint64_t ipstart = 0; // ip of the start of the section (if found)
+    if (it != objmap.end() && dwAddr < it->first + it->second.SectionSize) {
         ipstart = (uint64_t)(intptr_t)(*it).first;
     }
     uv_rwlock_rdunlock(&threadsafe);
