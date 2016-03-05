@@ -1496,7 +1496,8 @@ void jl_dump_asm_internal(uintptr_t Fptr, size_t Fsize, size_t slide,
 static uint64_t compute_obj_symsize(const object::ObjectFile *obj, uint64_t offset)
 {
     for (const auto &sym_size : object::computeSymbolSizes(*obj))
-        if (offset == sym_size.first.getValue())
+        if (offset == sym_size.first.getValue() && sym_size.first.getType() == object::SymbolRef::ST_Function
+		&& sym_size.second != 0)
             return sym_size.second;
     return 0;
 }
@@ -1532,12 +1533,15 @@ const jl_value_t *jl_dump_function_asm(void *f, int raw_mc)
 #endif
     const ObjectFile *object = NULL;
     assert(fptr != 0);
-    if (!jl_DI_for_fptr(fptr, &symsize, &slide, &SectionSlide, &object, &context))
+    bool isJIT = true;
+    if (!jl_DI_for_fptr(fptr, &symsize, &slide, &SectionSlide, &object, &context)) {
+	isJIT = false;
         if (!jl_dylib_DI_for_fptr(fptr, &object, &context, &slide, false,
             NULL, NULL, NULL, NULL)) {
                 jl_printf(JL_STDERR, "WARNING: Unable to find function pointer\n");
                 return jl_cstr_to_string("");
         }
+    }
 #ifdef LLVM37
     if (symsize == 0)
         symsize = compute_obj_symsize(object, fptr + slide + SectionSlide);
@@ -1555,7 +1559,8 @@ const jl_value_t *jl_dump_function_asm(void *f, int raw_mc)
     }
 #ifdef LLVM37
     jl_dump_asm_internal(fptr, symsize, slide, context, stream);
-    jl_cleanup_DI(context);
+    if (isJIT)
+	jl_cleanup_DI(context);
 #else
     jl_dump_asm_internal(fptr, symsize, slide, context, fstream);
 #endif

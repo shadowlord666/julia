@@ -87,7 +87,6 @@ struct FuncInfo {
 #else
 struct ObjectInfo {
     const object::ObjectFile *object;
-    uint64_t SectionAddr;
     size_t SectionSize;
 #ifdef LLVM39
     DIContext *context;
@@ -99,7 +98,6 @@ struct ObjectInfo {
 #if defined(_OS_DARWIN_) && !defined(LLVM37)
     const char *name;
 #endif
-    jl_lambda_info_t *linfo;
 };
 #endif
 
@@ -215,6 +213,7 @@ class JuliaJITEventListener: public JITEventListener
     std::map<size_t, FuncInfo, revcomp> info;
 #else
     std::map<size_t, ObjectInfo, revcomp> objectmap;
+    std::map<size_t, jl_lambda_info_t *, revcomp> linfomap;
 #endif
 
 public:
@@ -252,7 +251,12 @@ public:
 #endif // ifndef USE_MCJIT
 
 #ifdef USE_MCJIT
+    jl_lambda_info_t *lookupLinfo(size_t pointer)
+    {
+        return linfomap.lower_bound(pointer)->second;
+    }
 #ifdef LLVM36
+
     virtual void NotifyObjectEmitted(const object::ObjectFile &obj,
                                      const RuntimeDyld::LoadedObjectInfo &L)
     {
@@ -392,16 +396,17 @@ public:
                 linfo = linfo_it->second;
                 linfo_in_flight.erase(linfo_it);
             }
+            if (linfo)
+                linfomap[Addr] = linfo;
             if (first) {
                 ObjectInfo tmp = {&debugObj,
-                    SectionAddr,
                     SectionSize,
 #ifdef LLVM39
                     new DWARFContextInMemory(debugObj, &L),
 #else
                     L.clone().release(),
 #endif
-                    linfo};
+                    };
                 objectmap[SectionAddr] = tmp;
                 first = false;
            }
@@ -706,7 +711,7 @@ bool jl_dylib_DI_for_fptr(size_t pointer, const llvm::object::ObjectFile **obj, 
         char *fname = ModuleInfo.LoadedImageName;
         DWORD64 fbase = ModuleInfo.BaseOfImage;
         *isSysImg = fbase == jl_sysimage_base;
-        if (onlySysImg && !isSysImg) {
+        if (onlySysImg && !*isSysImg) {
             return false;
         }
         static char frame_info_func[
@@ -915,7 +920,7 @@ static void jl_getDylibFunctionInfo(char **name, char **filename, size_t *line,
     jl_in_stackwalk = 0;
 #endif
     const object::ObjectFile *object;
-    llvm::DIContext *context;
+    llvm::DIContext *context = NULL;
     bool isSysImg;
     void *saddr;
     int64_t slide;
@@ -923,7 +928,7 @@ static void jl_getDylibFunctionInfo(char **name, char **filename, size_t *line,
         *fromC = 1;
         return;
     }
-
+    *fromC = !isSysImg;
     lookup_pointer(context, name, line, filename, inlinedat_line, inlinedat_file, pointer+slide,
                    isSysImg, fromC);
     if (isSysImg && sysimg_fvars) {
@@ -972,7 +977,7 @@ int jl_DI_for_fptr(uint64_t fptr, uint64_t *symsize, int64_t *slide, int64_t *Se
         *symsize = 0;
         *slide = 0;
         *object = fit->second.object;
-        *SectionSlide = -fit->second.SectionAddr;
+        *SectionSlide = -fit->first;
 #if defined(LLVM39)
         *context = fit->second.context;
 #elif defined(LLVM37)
@@ -1016,6 +1021,7 @@ void jl_getFunctionInfo(char **name, char **filename, size_t *line,
     uint64_t symsize;
     int64_t slide, SectionSlide;
     if (jl_DI_for_fptr(pointer, &symsize, &slide, &SectionSlide, &object, &context)) {
+        *outer_linfo = jl_jit_events->lookupLinfo(pointer);
         lookup_pointer(context, name, line, filename, inlinedat_line, inlinedat_file, pointer+slide, 1, fromC);
         jl_cleanup_DI(context);
     }
@@ -1096,8 +1102,6 @@ void jl_getFunctionInfo(char **name, char **filename, size_t *line,
     else {
         jl_getDylibFunctionInfo(name, filename, line, inlinedat_file, inlinedat_line, outer_linfo, pointer, fromC, skipC, skipInline);
     }
-
-    uv_rwlock_rdunlock(&threadsafe);
 }
 
 #if defined(LLVM37) && (defined(_OS_LINUX_) || (defined(_OS_DARWIN_) && defined(LLVM_SHLIB)))

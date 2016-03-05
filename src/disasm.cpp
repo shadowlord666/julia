@@ -272,7 +272,7 @@ static void print_source_line(raw_ostream &stream, DebugLoc Loc)
 #endif
 
 extern "C"
-void jl_dump_asm_internal(uintptr_t Fptr, size_t Fsize, size_t slide,
+void jl_dump_asm_internal(uintptr_t Fptr, size_t Fsize, int64_t slide,
 #ifndef USE_MCJIT
                           std::vector<JITEvent_EmittedFunctionDetails::LineStart> lineinfo,
 #else
@@ -432,7 +432,7 @@ void jl_dump_asm_internal(uintptr_t Fptr, size_t Fsize, size_t slide,
 
 #ifdef USE_MCJIT
     if (di_ctx == NULL) return;
-    DILineInfoTable lineinfo = di_ctx->getLineInfoForAddressRange(Fptr-slide, Fsize);
+    DILineInfoTable lineinfo = di_ctx->getLineInfoForAddressRange(Fptr+slide, Fsize);
 #else
     typedef std::vector<JITEvent_EmittedFunctionDetails::LineStart> LInfoVec;
 #endif
