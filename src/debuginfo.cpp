@@ -382,6 +382,7 @@ public:
             StringRef sName = sym_iter.getName().get();
             uint64_t SectionSize = Section->getSize();
 #if defined(_OS_WINDOWS_)
+            size_t Size = sym_size.second;
             if (SectionAddrCheck)
                 assert(SectionAddrCheck == SectionAddr);
             else
@@ -703,6 +704,8 @@ bool jl_dylib_DI_for_fptr(size_t pointer, const llvm::object::ObjectFile **obj, 
     bool onlySysImg, bool *isSysImg, void **saddr, char **name, char **filename)
 {
 #ifdef _OS_WINDOWS_
+    IMAGEHLP_MODULE64 ModuleInfo;
+    bool isvalid;
     ModuleInfo.SizeOfStruct = sizeof(IMAGEHLP_MODULE64);
     jl_in_stackwalk = 1;
     isvalid = SymGetModuleInfo64(GetCurrentProcess(), (DWORD64)pointer, &ModuleInfo);
@@ -717,8 +720,6 @@ bool jl_dylib_DI_for_fptr(size_t pointer, const llvm::object::ObjectFile **obj, 
         static char frame_info_func[
             sizeof(SYMBOL_INFO) +
             MAX_SYM_NAME * sizeof(TCHAR)];
-        static IMAGEHLP_LINE64 frame_info_line;
-        DWORD dwDisplacement = 0;
         DWORD64 dwDisplacement64 = 0;
         DWORD64 dwAddress = pointer;
         PSYMBOL_INFO pSymbol = (PSYMBOL_INFO)frame_info_func;
@@ -737,6 +738,11 @@ bool jl_dylib_DI_for_fptr(size_t pointer, const llvm::object::ObjectFile **obj, 
             // SymFromAddr failed
             //jl_printf(JL_STDERR,"SymFromAddr returned error : %lu\n", GetLastError());
         }
+
+        // If we didn't find the filename before in the debug
+        // info, use the dll name
+        if (filename && !*filename)
+            *filename = fname;
 
         jl_in_stackwalk = 0;
 #else // ifdef _OS_WINDOWS_
@@ -853,22 +859,22 @@ bool jl_dylib_DI_for_fptr(size_t pointer, const llvm::object::ObjectFile **obj, 
 #endif
 #ifdef _OS_WINDOWS_
 #ifdef LLVM35
-                assert(*obj->isCOFF());
-                llvm::object::COFFObjectFile *coffobj = (llvm::object::COFFObjectFile *)*obj;
+                assert((*obj)->isCOFF());
+                const llvm::object::COFFObjectFile *coffobj = (const llvm::object::COFFObjectFile *)*obj;
                 const llvm::object::pe32plus_header *pe32plus;
                 coffobj->getPE32PlusHeader(pe32plus);
                 if (pe32plus != NULL) {
-                    slide = pe32plus->ImageBase - fbase;
+                    *slide = pe32plus->ImageBase - fbase;
                 }
                 else {
                     const llvm::object::pe32_header *pe32;
                     coffobj->getPE32Header(pe32);
                     if (pe32 == NULL) {
-                        obj = NULL;
-                        context = NULL;
+                        *obj = NULL;
+                        *context = NULL;
                     }
                     else {
-                        slide = pe32->ImageBase - fbase;
+                        *slide = pe32->ImageBase - fbase;
                     }
                 }
 #endif
@@ -896,8 +902,8 @@ static void jl_getDylibFunctionInfo(char **name, char **filename, size_t *line,
     // This function is not allowed to reference any TLS variables since
     // it can be called from an unmanaged thread on OSX.
 #ifdef _OS_WINDOWS_
-    IMAGEHLP_MODULE64 ModuleInfo;
-    BOOL isvalid;
+    static IMAGEHLP_LINE64 frame_info_line;
+    DWORD dwDisplacement = 0;
     if (jl_in_stackwalk) {
         *fromC = 1;
         return;
@@ -911,11 +917,6 @@ static void jl_getDylibFunctionInfo(char **name, char **filename, size_t *line,
         if (frame_info_line.FileName && filename)
             jl_copy_str(filename, frame_info_line.FileName);
         *line = frame_info_line.LineNumber;
-    }
-    else if (*fromC) {
-        // No debug info, use dll name instead
-        if (filename)
-            jl_copy_str(filename, fname);
     }
     jl_in_stackwalk = 0;
 #endif
